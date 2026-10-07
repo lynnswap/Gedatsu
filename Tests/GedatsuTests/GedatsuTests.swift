@@ -1,136 +1,404 @@
+import Foundation
+import XCTest
 #if os(iOS)
 import UIKit
-internal extension ViewType {
-    func callLayout() {
-        setNeedsLayout()
-        layoutIfNeeded()
-    }
-}
 #elseif os(macOS)
 import AppKit
-internal extension ViewType {
-    func callLayout() {
-        needsLayout = true
-        layoutSubtreeIfNeeded()
-    }
-}
 #endif
-import XCTest
 @testable import Gedatsu
 
+internal extension ViewType {
+    func callLayout() {
+        #if os(iOS)
+        setNeedsLayout()
+        layoutIfNeeded()
+        #elseif os(macOS)
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        #endif
+    }
+}
 
 final class GedatsuTests: XCTestCase {
-    let input = Pipe()
-    let output = Pipe()
-    func testHookStdErrFlow() {
-        let reader = ReaderMock()
-        let writer = WriterMock()
-        let interceptor = InterceptorMock()
-        let gedatsu = Worker(reader: reader, writer: writer, interceptor: interceptor)
-        shared = gedatsu
-        defer { shared = nil }
+    func testSplitWarningReadsStaySuppressedUntilFormattingStarts() {
+        let finished = expectation(description: "Suppress split warning reads until its diagnostic starts formatting")
+        DispatchQueue.main.async {
+            let reader = ReaderMock()
+            let writer = WriterMock()
+            let interceptor = InterceptorImpl()
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            var writes: [Data] = []
+            var formatterCalls = 0
+            writer.writeContentClosure = { writes.append($0) }
+            interceptor.save {
+                formatterCalls += 1
+                writer.write(content: Data("formatted diagnostic\n".utf8))
+                DispatchQueue.main.async {
+                    XCTAssertEqual(formatterCalls, 1)
+                    XCTAssertEqual(writes, [Data("formatted diagnostic\n".utf8)])
+                    assertPassthrough(interceptor)
+                    let unrelatedOutput = Data("unrelated stderr output\n".utf8)
+                    reader.readReturnValue = unrelatedOutput
+                    worker.processOutput()
+                    XCTAssertEqual(reader.readCallsCount, 4)
+                    XCTAssertEqual(writes, [Data("formatted diagnostic\n".utf8), unrelatedOutput])
+                    finished.fulfill()
+                }
+            }
 
-        prepare: do {
-            let data = "abc".data(using: .utf8)!
-            
-            reader.readClosure = { data }
-            reader.underlyingReadingFileDescriptor = input.fileHandleForReading.fileDescriptor
-            reader.underlyingWritingFileDescriptor = input.fileHandleForWriting.fileDescriptor
-            
-            writer.underlyingWritingFileDescriptor = output.fileHandleForWriting.fileDescriptor
-            
-            interceptor.canInterceptClosure = { true }
+            for fragment in ["warning header", "constraint details", "warning footer"] {
+                reader.readReturnValue = Data(fragment.utf8)
+                worker.processOutput()
+            }
+            XCTAssertEqual(reader.readCallsCount, 3)
+            XCTAssertEqual(formatterCalls, 0)
+            XCTAssertTrue(writes.isEmpty)
         }
-        
-        ViewType.swizzle()
-        gedatsu.open()
-        
-        before: do {
-            XCTAssertFalse(reader.readCalled)
-            XCTAssertFalse(writer.writeContentCalled)
-            XCTAssertFalse(interceptor.saveClosureCalled)
-            XCTAssertFalse(interceptor.canInterceptCalled)
-            XCTAssertFalse(interceptor.interceptCalled)
-        }
+        wait(for: [finished], timeout: 10)
+    }
 
-        let view = ViewType(frame: .init(origin: .zero, size: .init(width: 375, height: 667)))
-        view.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            view.widthAnchor.constraint(equalToConstant: 100),
-            view.widthAnchor.constraint(equalToConstant: 10),
-        ])
-        
-        let expectation = XCTestExpectation(description: "Keep async queue")
-        interceptor.interceptClosure = {
-            expectation.fulfill()
+    func testWarningsQueuedWhileFormattingAreScheduledByTheirReadsInFIFOOrder() {
+        let finished = expectation(description: "Schedule each new warning on its stderr read during earlier formatting")
+        DispatchQueue.main.async {
+            let reader = ReaderMock()
+            let writer = WriterMock()
+            let queue = InterceptorImpl()
+            let interceptor = InterceptorMock()
+            var scheduled = 0
+            interceptor.saveClosureClosure = { queue.save(closure: $0) }
+            interceptor.prepareInterceptionClosure = {
+                let result = queue.prepareInterception()
+                if case .schedule = result { scheduled += 1 }
+                return result
+            }
+            interceptor.beginFormattingClosure = { queue.beginFormatting() }
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            var formatted: [String] = []
+            var writes: [Data] = []
+            writer.writeContentClosure = { writes.append($0) }
+            reader.readReturnValue = Data("first warning".utf8)
+            interceptor.save {
+                formatted.append("first")
+                writer.write(content: Data("first diagnostic\n".utf8))
+                DispatchQueue.main.async {
+                    reader.readReturnValue = Data("remaining warning fragment".utf8)
+                    worker.processOutput()
+                    XCTAssertEqual(scheduled, 3)
+                    XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)])
+                }
+                interceptor.save {
+                    formatted.append("second")
+                    writer.write(content: Data("second diagnostic\n".utf8))
+                }
+                interceptor.save {
+                    formatted.append("third")
+                    writer.write(content: Data("third diagnostic\n".utf8))
+                    DispatchQueue.main.async {
+                        XCTAssertEqual(formatted, ["first", "second", "third"])
+                        XCTAssertEqual(reader.readCallsCount, 4)
+                        XCTAssertEqual(scheduled, 3)
+                        XCTAssertEqual(writes, [Data("first diagnostic\n".utf8), Data("second diagnostic\n".utf8), Data("third diagnostic\n".utf8)])
+                        assertPassthrough(queue)
+                        finished.fulfill()
+                    }
+                }
+                reader.readReturnValue = Data("second warning".utf8)
+                worker.processOutput()
+                XCTAssertEqual(scheduled, 2)
+                reader.readReturnValue = Data("third warning".utf8)
+                worker.processOutput()
+                XCTAssertEqual(reader.readCallsCount, 3)
+                XCTAssertEqual(scheduled, 3)
+                XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)])
+            }
+            worker.processOutput()
+            XCTAssertEqual(reader.readCallsCount, 1)
+            XCTAssertEqual(scheduled, 1)
+            XCTAssertTrue(writes.isEmpty)
         }
-        
-        view.callLayout()
+        wait(for: [finished], timeout: 10)
+    }
 
-        XCTWaiter().wait(for: [expectation], timeout: 10)
-        
-        after: do {
-            XCTAssertTrue(reader.readCalled)
-            XCTAssertFalse(writer.writeContentCalled)
-            XCTAssertTrue(interceptor.saveClosureCalled)
-            XCTAssertTrue(interceptor.canInterceptCalled)
-            XCTAssertTrue(interceptor.interceptCalled)
+    func testQueuedWarningWaitsForItsPipeReadBeforeFormatting() {
+        let finished = expectation(description: "Keep a queued warning unformatted until its real pipe data is read")
+        DispatchQueue.main.async {
+            let reader = ReaderImpl()
+            let writer = WriterMock()
+            let interceptor = InterceptorImpl()
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            var formatted: [String] = []
+            var writes: [Data] = []
+            writer.writeContentClosure = { writes.append($0) }
+            interceptor.save {
+                formatted.append("first")
+                writer.write(content: Data("first diagnostic\n".utf8))
+                interceptor.save {
+                    formatted.append("second")
+                    writer.write(content: Data("second diagnostic\n".utf8))
+                    DispatchQueue.main.async {
+                        XCTAssertEqual(formatted, ["first", "second"])
+                        XCTAssertEqual(writes, [Data("first diagnostic\n".utf8), Data("second diagnostic\n".utf8)])
+                        assertPassthrough(interceptor)
+                        let unrelatedOutput = Data("unrelated stderr output\n".utf8)
+                        reader.pipe.fileHandleForWriting.write(unrelatedOutput)
+                        worker.processOutput()
+                        XCTAssertEqual(writes, [Data("first diagnostic\n".utf8), Data("second diagnostic\n".utf8), unrelatedOutput])
+                        finished.fulfill()
+                    }
+                }
+                reader.pipe.fileHandleForWriting.write(Data("second raw warning\n".utf8))
+            }
+            reader.pipe.fileHandleForWriting.write(Data("first raw warning\n".utf8))
+            worker.processOutput()
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    XCTAssertEqual(formatted, ["first"], "An unread warning must not be formatted by completion of an earlier diagnostic.")
+                    XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)])
+                    worker.processOutput()
+                    XCTAssertEqual(formatted, ["first"])
+                    XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)], "Reading the second warning must suppress its raw pipe contents.")
+                }
+            }
+        }
+        wait(for: [finished], timeout: 10)
+    }
+
+    func testFormatterStderrIsPassedThroughAfterFormattingStarts() {
+        let finished = expectation(description: "Pass through a custom stderr log emitted during formatting")
+        DispatchQueue.main.async {
+            let reader = ReaderImpl()
+            let writer = WriterMock()
+            let interceptor = InterceptorImpl()
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            var writes: [Data] = []
+            writer.writeContentClosure = { writes.append($0) }
+            let customLog = Data("custom stderr emitted by formatter\n".utf8)
+            let diagnostic = Data("formatted diagnostic\n".utf8)
+            interceptor.save {
+                reader.pipe.fileHandleForWriting.write(customLog)
+                worker.processOutput()
+                XCTAssertEqual(writes, [customLog], "Formatting must not suppress unrelated stderr after its warning has been read.")
+                writer.write(content: diagnostic)
+                DispatchQueue.main.async {
+                    XCTAssertEqual(writes, [customLog, diagnostic])
+                    assertPassthrough(interceptor)
+                    finished.fulfill()
+                }
+            }
+            reader.pipe.fileHandleForWriting.write(Data("Auto Layout warning\n".utf8))
+            worker.processOutput()
+            XCTAssertTrue(writes.isEmpty)
+        }
+        wait(for: [finished], timeout: 10)
+    }
+
+    func testConcurrentCaptureAndDrainPreserveEveryDiagnosticOnce() {
+        let producerCount = 4
+        let consumerCount = 3
+        let capture = ConcurrentDiagnostics(producerCount: producerCount, consumerCount: consumerCount)
+        for _ in 0..<consumerCount {
+            capture.completion.enter()
+            Thread(target: capture, selector: #selector(ConcurrentDiagnostics.consume(_:)), object: nil).start()
+        }
+        for producer in 0..<producerCount {
+            capture.completion.enter()
+            Thread(target: capture, selector: #selector(ConcurrentDiagnostics.produce(_:)), object: NSNumber(value: producer)).start()
+        }
+        let result = capture.completion.wait(timeout: .now() + 10)
+        XCTAssertEqual(result, .success)
+        guard result == .success else { return }
+        let expected = Set((0..<producerCount).flatMap { producer in
+            (0..<capture.diagnosticsPerProducer).map { "\(producer):\($0)" }
+        })
+        XCTAssertEqual(capture.contents.count, expected.count)
+        XCTAssertEqual(Set(capture.contents), expected)
+        assertPassthrough(capture.interceptor)
+    }
+
+    func testCapturedWarningRetainsLayoutGuideUntilDeferredFormattingCompletes() {
+        let finished = expectation(description: "Retain a layout guide until deferred diagnostic output completes")
+        DispatchQueue.main.async {
+            let reader = ReaderMock()
+            reader.readReturnValue = Data("Auto Layout warning".utf8)
+            let writer = WriterMock()
+            var output = Data()
+            writer.writeContentClosure = { output.append($0) }
+            let interceptor = InterceptorImpl()
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            let formatter = LayoutGuideFormatter()
+            let previousWorker = shared
+            let previousFormatter = defaultFormatter
+            shared = worker
+            defaultFormatter = formatter
+            ViewType.swizzle()
+            let restore = {
+                ViewType.swizzle()
+                defaultFormatter = previousFormatter
+                shared = previousWorker
+            }
+
+            let view = ViewType(frame: CGRect(x: 0, y: 0, width: 375, height: 667))
+            weak var retainedGuide: LayoutGuideType?
+            autoreleasepool {
+                let guide = LayoutGuideType()
+                retainedGuide = guide
+                formatter.guide = guide
+                view.addLayoutGuide(guide)
+                let constraints = [
+                    guide.widthAnchor.constraint(equalToConstant: 100),
+                    guide.widthAnchor.constraint(equalToConstant: 10),
+                ]
+                NSLayoutConstraint.activate(constraints)
+                view.callLayout()
+                NSLayoutConstraint.deactivate(constraints)
+                view.removeLayoutGuide(guide)
+            }
+
+            XCTAssertNotNil(retainedGuide)
+            XCTAssertTrue(formatter.contents.isEmpty, "Formatting must not run inside the Auto Layout warning callback.")
+            XCTAssertTrue(output.isEmpty)
+            guard retainedGuide != nil, formatter.contents.isEmpty else {
+                restore()
+                finished.fulfill()
+                return
+            }
+            worker.processOutput()
+            XCTAssertTrue(formatter.contents.isEmpty, "Formatting must remain deferred until the main queue runs the diagnostic.")
+
+            DispatchQueue.main.async {
+                defer {
+                    restore()
+                    finished.fulfill()
+                }
+                XCTAssertEqual(reader.readCallsCount, 1)
+                XCTAssertFalse(formatter.contents.isEmpty)
+                XCTAssertEqual(output, Data(formatter.contents.joined().utf8))
+                XCTAssertEqual(formatter.callsAfterRelease, 0)
+                XCTAssertNil(retainedGuide)
+                assertPassthrough(interceptor)
+            }
+        }
+        wait(for: [finished], timeout: 10)
+    }
+
+    func testContextRetainsBothItemsOfConstraintOutsideExclusiveConstraints() {
+        let finished = expectation(description: "Retain both constraint items for a custom formatter")
+        DispatchQueue.main.async {
+            defer { finished.fulfill() }
+            let view = ViewType()
+            var context: Context?
+            weak var firstGuide: LayoutGuideType?
+            weak var secondGuide: LayoutGuideType?
+            autoreleasepool {
+                let first = LayoutGuideType()
+                let second = LayoutGuideType()
+                firstGuide = first
+                secondGuide = second
+                view.addLayoutGuide(first)
+                view.addLayoutGuide(second)
+                let constraint = first.widthAnchor.constraint(equalTo: second.widthAnchor)
+                context = Context(view: view, constraint: constraint, exclusiveConstraints: [])
+                view.removeLayoutGuide(first)
+                view.removeLayoutGuide(second)
+            }
+            XCTAssertNotNil(context)
+            XCTAssertNotNil(firstGuide)
+            XCTAssertNotNil(secondGuide)
+            autoreleasepool { context = nil }
+            XCTAssertNil(firstGuide)
+            XCTAssertNil(secondGuide)
+        }
+        wait(for: [finished], timeout: 10)
+    }
+}
+
+private final class LayoutGuideFormatter: Gedatsu.Formatter {
+    weak var guide: LayoutGuideType?
+    var contents: [String] = []
+    var callsAfterRelease = 0
+
+    func format(context: Context) -> String {
+        guard guide != nil else {
+            callsAfterRelease += 1
+            XCTFail("The formatter ran after its layout guide was released.")
+            return "late diagnostic"
+        }
+        let content = HierarchyFormatter<ViewType>().format(context: context)
+        contents.append(content + "\n")
+        return content
+    }
+}
+
+private final class ConcurrentDiagnostics: NSObject {
+    let interceptor = InterceptorImpl()
+    let completion = DispatchGroup()
+    let diagnosticsPerProducer = 250
+    private let lock = NSLock()
+    private let available = DispatchSemaphore(value: 0)
+    private let consumerCount: Int
+    private var remainingProducers: Int
+    private var collected: [String] = []
+
+    init(producerCount: Int, consumerCount: Int) {
+        self.remainingProducers = producerCount
+        self.consumerCount = consumerCount
+        super.init()
+    }
+
+    @objc func produce(_ producer: NSNumber) {
+        defer { completion.leave() }
+        for diagnostic in 0..<diagnosticsPerProducer {
+            let content = "\(producer.intValue):\(diagnostic)"
+            interceptor.save { self.record(content) }
+            available.signal()
+        }
+        lock.lock()
+        remainingProducers -= 1
+        let finished = remainingProducers == 0
+        lock.unlock()
+        if finished {
+            for _ in 0..<consumerCount {
+                available.signal()
+            }
         }
     }
-    
-    func testNoHookStdErrFlow() {
-        let reader = ReaderMock()
-        let writer = WriterMock()
-        let interceptor = InterceptorMock()
-        let gedatsu = Worker(reader: reader, writer: writer, interceptor: interceptor)
-        shared = gedatsu
-        defer { shared = nil }
 
-        let data = "abc".data(using: .utf8)!
-        prepare: do {
-            reader.readClosure = { data }
-            reader.underlyingReadingFileDescriptor = input.fileHandleForReading.fileDescriptor
-            reader.underlyingWritingFileDescriptor = input.fileHandleForWriting.fileDescriptor
-            
-            writer.underlyingWritingFileDescriptor = output.fileHandleForWriting.fileDescriptor
-            
-            interceptor.canInterceptClosure = { false }
+    @objc func consume(_ object: NSObject?) {
+        defer { completion.leave() }
+        while available.wait(timeout: .now() + 5) == .success {
+            lock.lock()
+            let finished = remainingProducers == 0
+            lock.unlock()
+            switch interceptor.prepareInterception() {
+            case .schedule(let closure):
+                interceptor.beginFormatting()
+                closure()
+            case .pending, .passthrough:
+                if finished { return }
+            }
         }
-        
-        ViewType.swizzle()
-        gedatsu.open()
-        
-        before: do {
-            XCTAssertFalse(reader.readCalled)
-            XCTAssertFalse(writer.writeContentCalled)
-            XCTAssertFalse(interceptor.saveClosureCalled)
-            XCTAssertFalse(interceptor.canInterceptCalled)
-            XCTAssertFalse(interceptor.interceptCalled)
-        }
-        
-        let view = ViewType(frame: .init(origin: .zero, size: .init(width: 375, height: 667)))
-        view.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            view.widthAnchor.constraint(equalToConstant: 100),
-            view.widthAnchor.constraint(equalToConstant: 10),
-        ])
-        
-        let expectation = XCTestExpectation(description: "Keep async queue")
-        writer.writeContentClosure = {
-            XCTAssertEqual($0, data)
-            expectation.fulfill()
-        }
+    }
 
-        view.callLayout()
+    private func record(_ content: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        collected.append(content)
+    }
 
-        XCTWaiter().wait(for: [expectation], timeout: 10)
-        
-        after: do {
-            XCTAssertTrue(reader.readCalled)
-            XCTAssertTrue(writer.writeContentCalled)
-            XCTAssertFalse(interceptor.saveClosureCalled)
-            XCTAssertTrue(interceptor.canInterceptCalled)
-            XCTAssertFalse(interceptor.interceptCalled)
-        }
+    var contents: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return collected
+    }
+}
+
+private func assertPassthrough(_ interceptor: Interceptor, file: StaticString = #file, line: UInt = #line) {
+    switch interceptor.prepareInterception() {
+    case .passthrough:
+        break
+    case .pending:
+        XCTFail("A diagnostic is still waiting to start formatting.", file: file, line: line)
+    case .schedule:
+        XCTFail("A diagnostic is still queued.", file: file, line: line)
     }
 }

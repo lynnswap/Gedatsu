@@ -62,31 +62,31 @@ class InterceptorMock: Interceptor {
         saveClosureClosure?(closure)
     }
 
-    //MARK: - canIntercept
+    //MARK: - prepareInterception
 
-    var canInterceptCallsCount = 0
-    var canInterceptCalled: Bool {
-        return canInterceptCallsCount > 0
+    var prepareInterceptionCallsCount = 0
+    var prepareInterceptionCalled: Bool {
+        return prepareInterceptionCallsCount > 0
     }
-    var canInterceptReturnValue: Bool!
-    var canInterceptClosure: (() -> Bool)?
+    var prepareInterceptionReturnValue: Interception!
+    var prepareInterceptionClosure: (() -> Interception)?
 
-    func canIntercept() -> Bool {
-        canInterceptCallsCount += 1
-        return canInterceptClosure.map({ $0() }) ?? canInterceptReturnValue
+    func prepareInterception() -> Interception {
+        prepareInterceptionCallsCount += 1
+        return prepareInterceptionClosure.map({ $0() }) ?? prepareInterceptionReturnValue
     }
 
-    //MARK: - intercept
+    //MARK: - beginFormatting
 
-    var interceptCallsCount = 0
-    var interceptCalled: Bool {
-        return interceptCallsCount > 0
+    var beginFormattingCallsCount = 0
+    var beginFormattingCalled: Bool {
+        return beginFormattingCallsCount > 0
     }
-    var interceptClosure: (() -> Void)?
+    var beginFormattingClosure: (() -> Void)?
 
-    func intercept() {
-        interceptCallsCount += 1
-        interceptClosure?()
+    func beginFormatting() {
+        beginFormattingCallsCount += 1
+        beginFormattingClosure?()
     }
 
 }

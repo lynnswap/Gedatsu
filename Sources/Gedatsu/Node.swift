@@ -47,10 +47,16 @@ public class Context {
     public let view: ViewType
     public let constraint: NSLayoutConstraint
     public let exclusiveConstraints: [NSLayoutConstraint]
+    // Constraint items are unowned, and the tree retains a layout guide's owning view instead of the guide.
+    private let constraintItems: [AnyObject]
+
     public init(view: ViewType, constraint: NSLayoutConstraint, exclusiveConstraints: [NSLayoutConstraint]) {
         self.view = view
         self.constraint = constraint
         self.exclusiveConstraints = exclusiveConstraints
+        self.constraintItems = ([constraint] + exclusiveConstraints)
+            .flatMap { [$0.firstItem, $0.secondItem] }
+            .compactMap { $0 }
     }
     
     private func ancestors(from node: Node, to latestNode: Node?) -> [Node] {
