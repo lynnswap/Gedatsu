@@ -24,10 +24,22 @@ internal class Worker {
     func processOutput() {
         // Drain stderr even when replacing its contents, so the read source can advance.
         let data = reader.read()
-        if let closure = interceptor.takeNext() {
-            DispatchQueue.main.async(execute: closure)
-        } else {
+        switch interceptor.prepareInterception() {
+        case .passthrough:
             writer.write(content: data)
+        case .pending:
+            break
+        case .schedule(let closure):
+            schedule(closure)
+        }
+    }
+
+    private func schedule(_ closure: @escaping InterceptType) {
+        DispatchQueue.main.async {
+            closure()
+            if let next = self.interceptor.completeInterception() {
+                self.schedule(next)
+            }
         }
     }
 }
