@@ -36,8 +36,8 @@ internal class Worker {
 
     private func schedule(_ closure: @escaping InterceptType) {
         DispatchQueue.main.async {
+            self.interceptor.beginFormatting()
             closure()
-            self.interceptor.completeInterception()
         }
     }
 }

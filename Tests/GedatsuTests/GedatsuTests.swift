@@ -20,8 +20,8 @@ internal extension ViewType {
 }
 
 final class GedatsuTests: XCTestCase {
-    func testSplitWarningReadsStaySuppressedUntilFormattingCompletes() {
-        let finished = expectation(description: "Suppress split warning reads until its diagnostic completes")
+    func testSplitWarningReadsStaySuppressedUntilFormattingStarts() {
+        let finished = expectation(description: "Suppress split warning reads until its diagnostic starts formatting")
         DispatchQueue.main.async {
             let reader = ReaderMock()
             let writer = WriterMock()
@@ -57,8 +57,8 @@ final class GedatsuTests: XCTestCase {
         wait(for: [finished], timeout: 10)
     }
 
-    func testWarningsQueuedDuringAnActiveDiagnosticAreScheduledByTheirReadsInFIFOOrder() {
-        let finished = expectation(description: "Schedule each warning on its stderr read while earlier diagnostics remain active")
+    func testWarningsQueuedWhileFormattingAreScheduledByTheirReadsInFIFOOrder() {
+        let finished = expectation(description: "Schedule each new warning on its stderr read during earlier formatting")
         DispatchQueue.main.async {
             let reader = ReaderMock()
             let writer = WriterMock()
@@ -71,7 +71,7 @@ final class GedatsuTests: XCTestCase {
                 if case .schedule = result { scheduled += 1 }
                 return result
             }
-            interceptor.completeInterceptionClosure = { queue.completeInterception() }
+            interceptor.beginFormattingClosure = { queue.beginFormatting() }
             let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
             var formatted: [String] = []
             var writes: [Data] = []
@@ -159,6 +159,35 @@ final class GedatsuTests: XCTestCase {
                     XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)], "Reading the second warning must suppress its raw pipe contents.")
                 }
             }
+        }
+        wait(for: [finished], timeout: 10)
+    }
+
+    func testFormatterStderrIsPassedThroughAfterFormattingStarts() {
+        let finished = expectation(description: "Pass through a custom stderr log emitted during formatting")
+        DispatchQueue.main.async {
+            let reader = ReaderImpl()
+            let writer = WriterMock()
+            let interceptor = InterceptorImpl()
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            var writes: [Data] = []
+            writer.writeContentClosure = { writes.append($0) }
+            let customLog = Data("custom stderr emitted by formatter\n".utf8)
+            let diagnostic = Data("formatted diagnostic\n".utf8)
+            interceptor.save {
+                reader.pipe.fileHandleForWriting.write(customLog)
+                worker.processOutput()
+                XCTAssertEqual(writes, [customLog], "Formatting must not suppress unrelated stderr after its warning has been read.")
+                writer.write(content: diagnostic)
+                DispatchQueue.main.async {
+                    XCTAssertEqual(writes, [customLog, diagnostic])
+                    assertPassthrough(interceptor)
+                    finished.fulfill()
+                }
+            }
+            reader.pipe.fileHandleForWriting.write(Data("Auto Layout warning\n".utf8))
+            worker.processOutput()
+            XCTAssertTrue(writes.isEmpty)
         }
         wait(for: [finished], timeout: 10)
     }
@@ -342,8 +371,8 @@ private final class ConcurrentDiagnostics: NSObject {
             lock.unlock()
             switch interceptor.prepareInterception() {
             case .schedule(let closure):
+                interceptor.beginFormatting()
                 closure()
-                interceptor.completeInterception()
             case .pending, .passthrough:
                 if finished { return }
             }
@@ -368,7 +397,7 @@ private func assertPassthrough(_ interceptor: Interceptor, file: StaticString = 
     case .passthrough:
         break
     case .pending:
-        XCTFail("Diagnostic processing is still active.", file: file, line: line)
+        XCTFail("A diagnostic is still waiting to start formatting.", file: file, line: line)
     case .schedule:
         XCTFail("A diagnostic is still queued.", file: file, line: line)
     }

@@ -11,13 +11,13 @@ internal enum Interception {
 internal protocol Interceptor {
     func save(closure: @escaping InterceptType)
     func prepareInterception() -> Interception
-    func completeInterception()
+    func beginFormatting()
 }
 
 internal class InterceptorImpl: Interceptor {
     private let lock = NSLock()
     private var queue: [InterceptType] = []
-    // A warning can span several stderr reads before its formatter finishes.
+    // Suppress split warning reads while their formatters are waiting on the main queue.
     private var scheduledCount = 0
 
     func save(closure: @escaping InterceptType) {
@@ -36,7 +36,7 @@ internal class InterceptorImpl: Interceptor {
         return scheduledCount > 0 ? .pending : .passthrough
     }
 
-    func completeInterception() {
+    func beginFormatting() {
         lock.lock()
         defer { lock.unlock() }
         scheduledCount -= 1

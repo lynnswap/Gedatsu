@@ -76,17 +76,17 @@ class InterceptorMock: Interceptor {
         return prepareInterceptionClosure.map({ $0() }) ?? prepareInterceptionReturnValue
     }
 
-    //MARK: - completeInterception
+    //MARK: - beginFormatting
 
-    var completeInterceptionCallsCount = 0
-    var completeInterceptionCalled: Bool {
-        return completeInterceptionCallsCount > 0
+    var beginFormattingCallsCount = 0
+    var beginFormattingCalled: Bool {
+        return beginFormattingCallsCount > 0
     }
-    var completeInterceptionClosure: (() -> Void)?
+    var beginFormattingClosure: (() -> Void)?
 
-    func completeInterception() {
-        completeInterceptionCallsCount += 1
-        completeInterceptionClosure?()
+    func beginFormatting() {
+        beginFormattingCallsCount += 1
+        beginFormattingClosure?()
     }
 
 }
