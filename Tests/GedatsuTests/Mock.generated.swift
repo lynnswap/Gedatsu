@@ -62,31 +62,18 @@ class InterceptorMock: Interceptor {
         saveClosureClosure?(closure)
     }
 
-    //MARK: - canIntercept
+    //MARK: - takeNext
 
-    var canInterceptCallsCount = 0
-    var canInterceptCalled: Bool {
-        return canInterceptCallsCount > 0
+    var takeNextCallsCount = 0
+    var takeNextCalled: Bool {
+        return takeNextCallsCount > 0
     }
-    var canInterceptReturnValue: Bool!
-    var canInterceptClosure: (() -> Bool)?
+    var takeNextReturnValue: (() -> Void)?
+    var takeNextClosure: (() -> (() -> Void)?)?
 
-    func canIntercept() -> Bool {
-        canInterceptCallsCount += 1
-        return canInterceptClosure.map({ $0() }) ?? canInterceptReturnValue
-    }
-
-    //MARK: - intercept
-
-    var interceptCallsCount = 0
-    var interceptCalled: Bool {
-        return interceptCallsCount > 0
-    }
-    var interceptClosure: (() -> Void)?
-
-    func intercept() {
-        interceptCallsCount += 1
-        interceptClosure?()
+    func takeNext() -> (() -> Void)? {
+        takeNextCallsCount += 1
+        return takeNextClosure.map({ $0() }) ?? takeNextReturnValue
     }
 
 }

@@ -1,7 +1,6 @@
 import Foundation
 
 internal class Worker {
-    private let lock = NSLock()
     internal let reader: Reader
     internal let writer: Writer
     internal let interceptor: Interceptor
@@ -17,20 +16,19 @@ internal class Worker {
         _ = dup2(reader.writingFileDescriptor, STDERR_FILENO)
         source = DispatchSource.makeReadSource(fileDescriptor: reader.readingFileDescriptor, queue: .init(label: "com.bannzai.gedatsu"))
         source.setEventHandler {
-            self.lock.lock()
-            defer { self.lock.unlock() }
-            // NOTE: it is necessary to call and dispose read `data` when if not use `data`
-            let data = self.reader.read()
-            switch self.interceptor.canIntercept() {
-            case true:
-                DispatchQueue.main.async {
-                    self.interceptor.intercept()
-                }
-            case false:
-                self.writer.write(content: data)
-            }
+            self.processOutput()
         }
         source.resume()
+    }
+
+    func processOutput() {
+        // Drain stderr even when replacing its contents, so the read source can advance.
+        let data = reader.read()
+        if let closure = interceptor.takeNext() {
+            DispatchQueue.main.async(execute: closure)
+        } else {
+            writer.write(content: data)
+        }
     }
 }
 
