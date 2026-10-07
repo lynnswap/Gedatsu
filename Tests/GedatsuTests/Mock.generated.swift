@@ -82,12 +82,11 @@ class InterceptorMock: Interceptor {
     var completeInterceptionCalled: Bool {
         return completeInterceptionCallsCount > 0
     }
-    var completeInterceptionReturnValue: (() -> Void)?
-    var completeInterceptionClosure: (() -> (() -> Void)?)?
+    var completeInterceptionClosure: (() -> Void)?
 
-    func completeInterception() -> (() -> Void)? {
+    func completeInterception() {
         completeInterceptionCallsCount += 1
-        return completeInterceptionClosure.map({ $0() }) ?? completeInterceptionReturnValue
+        completeInterceptionClosure?()
     }
 
 }

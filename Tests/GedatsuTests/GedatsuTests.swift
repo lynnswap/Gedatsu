@@ -57,12 +57,21 @@ final class GedatsuTests: XCTestCase {
         wait(for: [finished], timeout: 10)
     }
 
-    func testWarningsQueuedDuringFormattingCompleteInFIFOOrderWithoutExtraReads() {
-        let finished = expectation(description: "Complete warnings queued during active formatting without extra stderr reads")
+    func testWarningsQueuedDuringAnActiveDiagnosticAreScheduledByTheirReadsInFIFOOrder() {
+        let finished = expectation(description: "Schedule each warning on its stderr read while earlier diagnostics remain active")
         DispatchQueue.main.async {
             let reader = ReaderMock()
             let writer = WriterMock()
-            let interceptor = InterceptorImpl()
+            let queue = InterceptorImpl()
+            let interceptor = InterceptorMock()
+            var scheduled = 0
+            interceptor.saveClosureClosure = { queue.save(closure: $0) }
+            interceptor.prepareInterceptionClosure = {
+                let result = queue.prepareInterception()
+                if case .schedule = result { scheduled += 1 }
+                return result
+            }
+            interceptor.completeInterceptionClosure = { queue.completeInterception() }
             let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
             var formatted: [String] = []
             var writes: [Data] = []
@@ -71,6 +80,12 @@ final class GedatsuTests: XCTestCase {
             interceptor.save {
                 formatted.append("first")
                 writer.write(content: Data("first diagnostic\n".utf8))
+                DispatchQueue.main.async {
+                    reader.readReturnValue = Data("remaining warning fragment".utf8)
+                    worker.processOutput()
+                    XCTAssertEqual(scheduled, 3)
+                    XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)])
+                }
                 interceptor.save {
                     formatted.append("second")
                     writer.write(content: Data("second diagnostic\n".utf8))
@@ -80,25 +95,70 @@ final class GedatsuTests: XCTestCase {
                     writer.write(content: Data("third diagnostic\n".utf8))
                     DispatchQueue.main.async {
                         XCTAssertEqual(formatted, ["first", "second", "third"])
-                        XCTAssertEqual(reader.readCallsCount, 2)
+                        XCTAssertEqual(reader.readCallsCount, 4)
+                        XCTAssertEqual(scheduled, 3)
                         XCTAssertEqual(writes, [Data("first diagnostic\n".utf8), Data("second diagnostic\n".utf8), Data("third diagnostic\n".utf8)])
-                        assertPassthrough(interceptor)
-                        let unrelatedOutput = Data("unrelated stderr output\n".utf8)
-                        reader.readReturnValue = unrelatedOutput
-                        worker.processOutput()
-                        XCTAssertEqual(reader.readCallsCount, 3)
-                        XCTAssertEqual(writes.last, unrelatedOutput)
+                        assertPassthrough(queue)
                         finished.fulfill()
                     }
                 }
-                reader.readReturnValue = Data("two additional warnings".utf8)
+                reader.readReturnValue = Data("second warning".utf8)
                 worker.processOutput()
-                XCTAssertEqual(reader.readCallsCount, 2)
+                XCTAssertEqual(scheduled, 2)
+                reader.readReturnValue = Data("third warning".utf8)
+                worker.processOutput()
+                XCTAssertEqual(reader.readCallsCount, 3)
+                XCTAssertEqual(scheduled, 3)
                 XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)])
             }
             worker.processOutput()
             XCTAssertEqual(reader.readCallsCount, 1)
+            XCTAssertEqual(scheduled, 1)
             XCTAssertTrue(writes.isEmpty)
+        }
+        wait(for: [finished], timeout: 10)
+    }
+
+    func testQueuedWarningWaitsForItsPipeReadBeforeFormatting() {
+        let finished = expectation(description: "Keep a queued warning unformatted until its real pipe data is read")
+        DispatchQueue.main.async {
+            let reader = ReaderImpl()
+            let writer = WriterMock()
+            let interceptor = InterceptorImpl()
+            let worker = Worker(reader: reader, writer: writer, interceptor: interceptor)
+            var formatted: [String] = []
+            var writes: [Data] = []
+            writer.writeContentClosure = { writes.append($0) }
+            interceptor.save {
+                formatted.append("first")
+                writer.write(content: Data("first diagnostic\n".utf8))
+                interceptor.save {
+                    formatted.append("second")
+                    writer.write(content: Data("second diagnostic\n".utf8))
+                    DispatchQueue.main.async {
+                        XCTAssertEqual(formatted, ["first", "second"])
+                        XCTAssertEqual(writes, [Data("first diagnostic\n".utf8), Data("second diagnostic\n".utf8)])
+                        assertPassthrough(interceptor)
+                        let unrelatedOutput = Data("unrelated stderr output\n".utf8)
+                        reader.pipe.fileHandleForWriting.write(unrelatedOutput)
+                        worker.processOutput()
+                        XCTAssertEqual(writes, [Data("first diagnostic\n".utf8), Data("second diagnostic\n".utf8), unrelatedOutput])
+                        finished.fulfill()
+                    }
+                }
+                reader.pipe.fileHandleForWriting.write(Data("second raw warning\n".utf8))
+            }
+            reader.pipe.fileHandleForWriting.write(Data("first raw warning\n".utf8))
+            worker.processOutput()
+            DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    XCTAssertEqual(formatted, ["first"], "An unread warning must not be formatted by completion of an earlier diagnostic.")
+                    XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)])
+                    worker.processOutput()
+                    XCTAssertEqual(formatted, ["first"])
+                    XCTAssertEqual(writes, [Data("first diagnostic\n".utf8)], "Reading the second warning must suppress its raw pipe contents.")
+                }
+            }
         }
         wait(for: [finished], timeout: 10)
     }
@@ -128,7 +188,6 @@ final class GedatsuTests: XCTestCase {
 
     func testCapturedWarningRetainsLayoutGuideUntilDeferredFormattingCompletes() {
         let finished = expectation(description: "Retain a layout guide until deferred diagnostic output completes")
-        var restore: (() -> Void)?
         DispatchQueue.main.async {
             let reader = ReaderMock()
             reader.readReturnValue = Data("Auto Layout warning".utf8)
@@ -143,15 +202,11 @@ final class GedatsuTests: XCTestCase {
             shared = worker
             defaultFormatter = formatter
             ViewType.swizzle()
-            var hasRestored = false
-            let cleanup = {
-                guard !hasRestored else { return }
-                hasRestored = true
+            let restore = {
                 ViewType.swizzle()
                 defaultFormatter = previousFormatter
                 shared = previousWorker
             }
-            restore = cleanup
 
             let view = ViewType(frame: CGRect(x: 0, y: 0, width: 375, height: 667))
             weak var retainedGuide: LayoutGuideType?
@@ -174,38 +229,27 @@ final class GedatsuTests: XCTestCase {
             XCTAssertTrue(formatter.contents.isEmpty, "Formatting must not run inside the Auto Layout warning callback.")
             XCTAssertTrue(output.isEmpty)
             guard retainedGuide != nil, formatter.contents.isEmpty else {
-                cleanup()
-                restore = nil
+                restore()
                 finished.fulfill()
                 return
             }
-            interceptor.save {
-                DispatchQueue.main.async {
-                    defer {
-                        cleanup()
-                        restore = nil
-                        finished.fulfill()
-                    }
-                    XCTAssertEqual(reader.readCallsCount, 1)
-                    XCTAssertFalse(formatter.contents.isEmpty)
-                    XCTAssertEqual(output, Data(formatter.contents.joined().utf8))
-                    XCTAssertEqual(formatter.callsAfterRelease, 0)
-                    XCTAssertNil(retainedGuide)
-                    assertPassthrough(interceptor)
-                }
-            }
             worker.processOutput()
             XCTAssertTrue(formatter.contents.isEmpty, "Formatting must remain deferred until the main queue runs the diagnostic.")
+
+            DispatchQueue.main.async {
+                defer {
+                    restore()
+                    finished.fulfill()
+                }
+                XCTAssertEqual(reader.readCallsCount, 1)
+                XCTAssertFalse(formatter.contents.isEmpty)
+                XCTAssertEqual(output, Data(formatter.contents.joined().utf8))
+                XCTAssertEqual(formatter.callsAfterRelease, 0)
+                XCTAssertNil(retainedGuide)
+                assertPassthrough(interceptor)
+            }
         }
         wait(for: [finished], timeout: 10)
-        if let cleanup = restore {
-            let restored = expectation(description: "Restore diagnostic globals after a failed asynchronous test")
-            DispatchQueue.main.async {
-                cleanup()
-                restored.fulfill()
-            }
-            wait(for: [restored], timeout: 10)
-        }
     }
 
     func testContextRetainsBothItemsOfConstraintOutsideExclusiveConstraints() {
@@ -297,16 +341,12 @@ private final class ConcurrentDiagnostics: NSObject {
             let finished = remainingProducers == 0
             lock.unlock()
             switch interceptor.prepareInterception() {
-            case .schedule(let initial):
-                var next: InterceptType? = initial
-                while let closure = next {
-                    closure()
-                    next = interceptor.completeInterception()
-                }
+            case .schedule(let closure):
+                closure()
+                interceptor.completeInterception()
             case .pending, .passthrough:
-                break
+                if finished { return }
             }
-            if finished { return }
         }
     }
 

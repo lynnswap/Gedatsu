@@ -11,14 +11,14 @@ internal enum Interception {
 internal protocol Interceptor {
     func save(closure: @escaping InterceptType)
     func prepareInterception() -> Interception
-    func completeInterception() -> InterceptType?
+    func completeInterception()
 }
 
 internal class InterceptorImpl: Interceptor {
     private let lock = NSLock()
     private var queue: [InterceptType] = []
     // A warning can span several stderr reads before its formatter finishes.
-    private var isIntercepting = false
+    private var scheduledCount = 0
 
     func save(closure: @escaping InterceptType) {
         lock.lock()
@@ -29,19 +29,16 @@ internal class InterceptorImpl: Interceptor {
     func prepareInterception() -> Interception {
         lock.lock()
         defer { lock.unlock() }
-        if isIntercepting { return .pending }
-        guard !queue.isEmpty else { return .passthrough }
-        isIntercepting = true
-        return .schedule(queue.removeFirst())
+        if !queue.isEmpty {
+            scheduledCount += 1
+            return .schedule(queue.removeFirst())
+        }
+        return scheduledCount > 0 ? .pending : .passthrough
     }
 
-    func completeInterception() -> InterceptType? {
+    func completeInterception() {
         lock.lock()
         defer { lock.unlock() }
-        guard !queue.isEmpty else {
-            isIntercepting = false
-            return nil
-        }
-        return queue.removeFirst()
+        scheduledCount -= 1
     }
 }
